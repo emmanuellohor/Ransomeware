@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+"""
+RootKiler Ransomware Decryptor
+Recovers files encrypted by the RootKiler simulator
+For authorized security research and incident response only
+"""
+
+import os
+import sys
+import time
+import logging
+from pathlib import Path
+from cryptography.fernet import Fernet
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import threading
+import json
+from datetime import datetime
+
+# Configuration
+ENCRYPTED_EXT = ".encrypted"
+DEFAULT_KEY_FILE = "decryption_key.txt"
+LOG_FILE = "decryption_log.txt"
+RESTORE_ORIGINAL = True  # Keep encrypted copy until decryption verified
+
+# Setup logging
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+class RootKilerDecryptor:
+    def __init__(self):
+        self.cipher = None
+        self.key = None
+        self.decrypted_count = 0
+        self.failed_count = 0
+        self.skipped_count = 0
+        self.total_size = 0
+        self.decrypted_size = 0
+        
+    def load_key(self, key_path):
+        """Load the Fernet encryption key."""
+        try:
+            with open(key_path, "rb") as f:
+                self.key = f.read()
+            self.cipher = Fernet(self.key)
+            logging.info(f"Key loaded successfully from {key_path}")
+            return True
+        except FileNotFoundError:
+            logging.error(f"Key file not found: {key_path}")
+            return False
+        except Exception as e:
+            logging.error(f"Error loading key: {str(e)}")
+            return False
+    
+    def validate_key(self, test_file=None):
+        """Validate the key by testing decryption on a sample file."""
+        if not self.cipher:
+            return False
+            
+        # If no test file provided, find first encrypted file
+        if not test_file:
+            for root, _, files in os.walk("."):
+                for file in files:
+                    if file.endswith(ENCRYPTED_EXT):
+                        test_file = os.path.join(root, file)
+                        break
+                if test_file:
+                    break
+        
+        if not test_file or not os.path.exists(test_file):
+            logging.warning("No encrypted files found for key validation")
+            return True  # No files to test, assume key is valid
+            
+        try:
+            with open(test_file, "rb") as f:
+                encrypted_data = f.read()
+            decrypted_data = self.cipher.decrypt(encrypted_data)
+            logging.info(f"Key validated successfully using {test_file}")
+            return True
+        except Exception as e:
+            logging.error(f"Key validation failed: {str(e)}")
+            return False
+    
+    def decrypt_file(self, encrypted_path):
+        """Decrypt a single file."""
+        try:
+            # Read encrypted data
+            with open(encrypted_path, "rb") as f:
+                encrypted_data = f.read()
+            
+            # Decrypt
+            decrypted_data = self.cipher.decrypt(encrypted_data)
+            
+            # Determine original path
+            if encrypted_path.endswith(ENCRYPTED_EXT):
+                original_path = encrypted_path[:-len(ENCRYPTED_EXT)]
+            else:
+                original_path = encrypted_path + ".decrypted"
+            
+            # Write decrypted data
+            with open(original_path, "wb") as f:
+                f.write(decrypted_data)
+            
+            # Verify decryption
+            with open(original_path, "rb") as f:
+                verify_data = f.read()
+            
+            if verify_data == decrypted_data:
+                if not RESTORE_ORIGINAL:
+                    os.remove(encrypted_path)  # Remove encrypted version
+                self.decrypted_count += 1
+                self.decrypted_size += len(decrypted_data)
+                logging.info(f"Decrypted: {encrypted_path} -> {original_path}")
+                return True
+            else:
+                logging.error(f"Verification failed for {encrypted_path}")
+                self.failed_count += 1
+                return False
+                
+        except Exception as e:
+            logging.error(f"Failed to decrypt {encrypted_path}: {str(e)}")
+            self.failed_count += 1
+            return False
+    
+    def scan_encrypted_files(self, directory):
+        """Scan directory for encrypted files."""
+        encrypted_files = []
+        for root, _, files in os.walk(directory):
+            for file in files:
+                if file.endswith(ENCRYPTED_EXT):
+                    full_path = os.path.join(root, file)
+                    encrypted_files.append(full_path)
+                    self.total_size += os.path.getsize(full_path)
+        return encrypted_files
+    
+    def decrypt_directory(self, directory, progress_callback=None):
+        """Decrypt all encrypted files in directory."""
+        encrypted_files = self.scan_encrypted_files(directory)
+        total_files = len(encrypted_files)
+        
+        if total_files == 0:
+            logging.info("No encrypted files found")
+            return {"status": "no_files", "decrypted": 0, "failed": 0}
+        
+        logging.info(f"Found {total_files} encrypted files ({self.total_size} bytes)")
+        
+        for i, file_path in enumerate(encrypted_files, 1):
+            if progress_callback:
+                progress_callback(i, total_files, file_path)
+            
+            self.decrypt_file(file_path)
+            
+            # Small delay to prevent system overload
+            time.sleep(0.01)
+        
+        return {
+            "status": "completed",
+            "total": total_files,
+            "decrypted": self.decrypted_count,
+            "failed": self.failed_count,
+            "skipped": self.skipped_count,
+            "size_recovered": self.decrypted_size
+        }
+
+
+class DecryptorGUI:
+    """GUI for the decryptor."""
+    
+    def __init__(self):
+        self.decryptor = RootKilerDecryptor()
+        self.root = tk.Tk()
+        self.root.title("RootKiler Decryptor")
+        self.root.geometry("600x400")
+        self.root.configure(bg="#1e1e1e")
+        
+        self.create_widgets()
+        
+    def create_widgets(self):
+        # Title
+        title = tk.Label(
+            self.root,
+            text="🔓 RootKiler Decryptor 🔓",
+            bg="#1e1e1e",
+            fg="#00FF00",
+            font=("Consolas", 16, "bold")
+        )
+        title.pack(pady=20)
+        
+        # Key file selection
+        key_frame = tk.Frame(self.root, bg="#1e1e1e")
+        key_frame.pack(fill="x", padx=20, pady=10)
+        
+        tk.Label(
+            key_frame,
+            text="Key File:",
+            bg="#1e1e1e",
+            fg="#00FF00",
+            font=("Consolas", 10)
+        ).pack(side="left")
+        
+        self.key_path = tk.StringVar(value=DEFAULT_KEY_FILE)
+        key_entry = tk.Entry(
+            key_frame,
+            textvariable=self.key_path,
+            bg="#2d2d2d",
+            fg="#00FF00",
+            insertbackground="#00FF00",
+            font=("Consolas", 10),
+            width=40
+        )
+        key_entry.pack(side="left", padx=10)
+        
+        tk.Button(
+            key_frame,
+            text="Browse",
+            command=self.browse_key,
+            bg="#00FF00",
+            fg="black",
+            font=("Consolas", 9, "bold")
+        ).pack(side="left")
+        
+        # Directory selection
+        dir_frame = tk.Frame(self.root, bg="#1e1e1e")
+        dir_frame.pack(fill="x", padx=20, pady=10)
+        
+        tk.Label(
+            dir_frame,
+            text="Directory:",
+            bg="#1e1e1e",
+            fg="#00FF00",
+            font=("Consolas", 10)
+        ).pack(side="left")
+        
+        self.dir_path = tk.StringVar(value=os.getcwd())
+        dir_entry = tk.Entry(
+            dir_frame,
+            textvariable=self.dir_path,
+            bg="#2d2d2d",
+            fg="#00FF00",
+            insertbackground="#00FF00",
+            font=("Consolas", 10),
+            width=40
+        )
+        dir_entry.pack(side="left", padx=10)
+        
+        tk.Button(
+            dir_frame,
+            text="Browse",
+            command=self.browse_directory,
+            bg="#00FF00",
+            fg="black",
+            font=("Consolas", 9, "bold")
+        ).pack(side="left")
+        
+        # Progress bar
+        self.progress = ttk.Progressbar(
+            self.root,
+            orient="horizontal",
+            length=400,
+            mode="determinate"
+        )
+        self.progress.pack(pady=20)
+        
+        # Status label
+        self.status_var = tk.StringVar(value="Ready")
+        status_label = tk.Label(
+            self.root,
+            textvariable=self.status_var,
+            bg="#1e1e1e",
+            fg="#00FF00",
+            font=("Consolas", 10)
+        )
+        status_label.pack()
+        
+        # Log display
+        self.log_text = tk.Text(
+            self.root,
+            bg="#2d2d2d",
+            fg="#00FF00",
+            font=("Consolas", 9),
+            height=10,
+            width=70
+        )
+        self.log_text.pack(pady=10, padx=20)
+        
+        # Buttons
+        btn_frame = tk.Frame(self.root, bg="#1e1e1e")
+        btn_frame.pack(pady=10)
+        
+        self.decrypt_btn = tk.Button(
+            btn_frame,
+            text="🔓 Start Decryption",
+            command=self.start_decryption,
+            bg="#00FF00",
+            fg="black",
+            font=("Consolas", 10, "bold"),
+            width=20
+        )
+        self.decrypt_btn.pack(side="left", padx=10)
+        
+        tk.Button(
+            btn_frame,
+            text="📊 Show Statistics",
+            command=self.show_stats,
+            bg="#0088FF",
+            fg="white",
+            font=("Consolas", 10, "bold"),
+            width=20
+        ).pack(side="left", padx=10)
+        
+    def browse_key(self):
+        filename = filedialog.askopenfilename(
+            title="Select Key File",
+            filetypes=[("Key Files", "*.txt"), ("All Files", "*.*")]
+        )
+        if filename:
+            self.key_path.set(filename)
+    
+    def browse_directory(self):
+        directory = filedialog.askdirectory(title="Select Directory to Decrypt")
+        if directory:
+            self.dir_path.set(directory)
+    
+    def log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{timestamp}] {message}\n")
+        self.log_text.see("end")
+        self.root.update()
+    
+    def update_progress(self, current, total, filename):
+        self.progress["value"] = (current / total) * 100
+        self.status_var.set(f"Decrypting {current}/{total}: {os.path.basename(filename)}")
+        self.root.update()
+    
+    def start_decryption(self):
+        key_file = self.key_path.get()
+        directory = self.dir_path.get()
+        
+        if not os.path.exists(key_file):
+            messagebox.showerror("Error", "Key file not found!")
+            return
+        
+        if not os.path.exists(directory):
+            messagebox.showerror("Error", "Directory not found!")
+            return
+        
+        # Load and validate key
+        self.log("Loading decryption key...")
+        if not self.decryptor.load_key(key_file):
+            messagebox.showerror("Error", "Failed to load key!")
+            return
+        
+        self.log("Validating key...")
+        if not self.decryptor.validate_key():
+            if not messagebox.askyesno("Warning", "Key validation failed. Continue anyway?"):
+                return
+        
+        # Start decryption in thread
+        self.decrypt_btn.config(state="disabled")
+        self.log(f"Starting decryption of {directory}...")
+        
+        def decrypt_thread():
+            result = self.decryptor.decrypt_directory(directory, self.update_progress)
+            
+            self.root.after(0, lambda: self.decryption_complete(result))
+        
+        threading.Thread(target=decrypt_thread, daemon=True).start()
+    
+    def decryption_complete(self, result):
+        self.decrypt_btn.config(state="normal")
+        self.progress["value"] = 100
+        
+        if result["status"] == "no_files":
+            self.status_var.set("No encrypted files found")
+            self.log("No encrypted files found in directory")
+            messagebox.showinfo("Complete", "No encrypted files found!")
+        else:
+            self.status_var.set(f"Decryption complete: {result['decrypted']} recovered, {result['failed']} failed")
+            self.log(f"Decryption complete!")
+            self.log(f"  Total files: {result['total']}")
+            self.log(f"  Decrypted: {result['decrypted']}")
+            self.log(f"  Failed: {result['failed']}")
+            self.log(f"  Data recovered: {result['size_recovered']} bytes")
+            
+            messagebox.showinfo(
+                "Decryption Complete",
+                f"Decrypted: {result['decrypted']} files\n"
+                f"Failed: {result['failed']} files\n"
+                f"Data recovered: {result['size_recovered'] / 1024:.2f} KB"
+            )
+    
+    def show_stats(self):
+        stats = f"""
+Decryption Statistics
+=====================
+Total encrypted files found: {self.decryptor.decrypted_count + self.decryptor.failed_count}
+Successfully decrypted: {self.decryptor.decrypted_count}
+Failed: {self.decryptor.failed_count}
+Total size processed: {self.decryptor.total_size / 1024:.2f} KB
+Data recovered: {self.decryptor.decrypted_size / 1024:.2f} KB
+Success rate: {(self.decryptor.decrypted_count / max(1, self.decryptor.decrypted_count + self.decryptor.failed_count)) * 100:.1f}%
+        """
+        
+        stats_window = tk.Toplevel(self.root)
+        stats_window.title("Statistics")
+        stats_window.geometry("400x300")
+        stats_window.configure(bg="#1e1e1e")
+        
+        tk.Label(
+            stats_window,
+            text=stats,
+            bg="#1e1e1e",
+            fg="#00FF00",
+            font=("Consolas", 10),
+            justify="left"
+        ).pack(pady=20, padx=20)
+    
+    def run(self):
+        self.root.mainloop()
+
+
+class CommandLineDecryptor:
+    """Command-line interface for the decryptor."""
+    
+    def __init__(self):
+        self.decryptor = RootKilerDecryptor()
+    
+    def run(self, args):
+        import argparse
+        
+        parser = argparse.ArgumentParser(description="RootKiler Ransomware Decryptor")
+        parser.add_argument("-k", "--key", default=DEFAULT_KEY_FILE, help="Path to decryption key")
+        parser.add_argument("-d", "--directory", default=".", help="Directory to decrypt")
+        parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+        parser.add_argument("--delete-encrypted", action="store_true", help="Delete encrypted files after decryption")
+        parser.add_argument("--gui", action="store_true", help="Launch GUI mode")
+        
+        parsed = parser.parse_args(args)
+        
+        if parsed.gui:
+            gui = DecryptorGUI()
+            gui.run()
+            return
+        
+        global RESTORE_ORIGINAL
+        RESTORE_ORIGINAL = not parsed.delete_encrypted
+        
+        print("🔓 RootKiler Decryptor 🔓")
+        print("=" * 40)
+        
+        # Load key
+        print(f"Loading key from {parsed.key}...")
+        if not self.decryptor.load_key(parsed.key):
+            print("❌ Failed to load key!")
+            return 1
+        
+        # Validate key
+        print("Validating key...")
+        if not self.decryptor.validate_key():
+            print("⚠️  Key validation failed! Decryption may fail.")
+            if input("Continue anyway? (y/n): ").lower() != 'y':
+                return 1
+        
+        # Decrypt
+        print(f"\nDecrypting {parsed.directory}...")
+        print("-" * 40)
+        
+        def progress(current, total, filename):
+            if parsed.verbose or current % 10 == 0:
+                print(f"[{current}/{total}] {os.path.basename(filename)}")
+        
+        result = self.decryptor.decrypt_directory(parsed.directory, progress)
+        
+        # Results
+        print("\n" + "=" * 40)
+        if result["status"] == "no_files":
+            print("No encrypted files found.")
+        else:
+            print(f"✅ Decryption complete!")
+            print(f"   Decrypted: {result['decrypted']} files")
+            print(f"   Failed: {result['failed']} files")
+            print(f"   Recovered: {result['size_recovered'] / 1024:.2f} KB")
+        
+        return 0
+
+
+# Emergency single-file decryption
+def decrypt_single_file(encrypted_path, key_path):
+    """Quick function to decrypt a single file."""
+    try:
+        with open(key_path, "rb") as f:
+            key = f.read()
+        cipher = Fernet(key)
+        
+        with open(encrypted_path, "rb") as f:
+            encrypted_data = f.read()
+        
+        decrypted_data = cipher.decrypt(encrypted_data)
+        
+        original_path = encrypted_path[:-len(ENCRYPTED_EXT)] if encrypted_path.endswith(ENCRYPTED_EXT) else encrypted_path + ".decrypted"
+        
+        with open(original_path, "wb") as f:
+            f.write(decrypted_data)
+        
+        return original_path
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return None
+
+
+# Bulk decryption with recovery report
+def generate_recovery_report(directory, output_file="recovery_report.json"):
+    """Generate a JSON report of recovery status."""
+    decryptor = RootKilerDecryptor()
+    encrypted_files = decryptor.scan_encrypted_files(directory)
+    
+    report = {
+        "timestamp": str(datetime.now()),
+        "directory": directory,
+        "encrypted_files_found": len(encrypted_files),
+        "files": []
+    }
+    
+    for file_path in encrypted_files:
+        file_info = {
+            "path": file_path,
+            "size": os.path.getsize(file_path),
+            "status": "pending"
+        }
+        report["files"].append(file_info)
+    
+    with open(output_file, "w") as f:
+        json.dump(report, f, indent=2)
+    
+    return report
+
+
+if __name__ == "__main__":
+    # Check if GUI available
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "--gui":
+            gui = DecryptorGUI()
+            gui.run()
+        elif len(sys.argv) > 1:
+            cli = CommandLineDecryptor()
+            sys.exit(cli.run(sys.argv[1:]))
+        else:
+            # Default: show help
+            print("RootKiler Decryptor")
+            print("\nUsage:")
+            print("  python decryptor.py --gui              # Launch GUI")
+            print("  python decryptor.py -k key.txt -d dir  # Command line")
+            print("  python decryptor.py -h                 # Show help")
+            print("\nFor single file recovery:")
+            print("  from decryptor import decrypt_single_file")
+            print("  decrypt_single_file('file.txt.encrypted', 'decryption_key.txt')")
+    except KeyboardInterrupt:
+        print("\nDecryption interrupted by user")
+        sys.exit(1)
